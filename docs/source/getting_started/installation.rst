@@ -141,6 +141,7 @@ Install LMCache
 
                             # Build LMCache. BUILD_WITH_HIP=1 makes setup.py pick cupy-rocm-7-0 automatically.
                             # PYTORCH_ROCM_ARCH selects the target GPU(s):
+                            #   gfx90a  -> MI250X / MI210
                             #   gfx942  -> MI300X / MI325X
                             #   gfx950  -> MI350X / MI355X
                             # Comma-separate to build a fat binary for multiple archs.

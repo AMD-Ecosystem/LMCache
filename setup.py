@@ -283,11 +283,15 @@ def rocm_extension() -> tuple[list, dict]:
                 "cxx": [  # hipcc is typically invoked as a C++ compiler
                     # '-D_GLIBCXX_USE_CXX11_ABI=0',
                     "-O3",
-                    "-std=c++17",
-                    # Add any HIP specific flags if needed.
-                    # For example, if you need to specify ROCm architecture:
-                    # '--offload-arch=gfx942' # (replace with your target arch)
-                    # '-x hip' # Sometimes needed to explicitly treat files as HIP
+                    # Torch's ROCm BuildExtension compiles the .hip sources at
+                    # -std=c++20; the plain .cpp sources (pybind/mem_alloc/utils
+                    # /recorders) include the same <torch/all.h> headers, which
+                    # use C++20 constructs (e.g. a `requires` constrained
+                    # template in c10/core/TensorImpl.h), so they must match.
+                    "-std=c++20",
+                    # Target arch is taken from PYTORCH_ROCM_ARCH (honored by
+                    # torch's ROCm BuildExtension) so this builds for gfx90a,
+                    # gfx942, gfx950, gfx1100, ... without a hardcoded literal.
                 ],
                 # No 'nvcc' key for hipcc with CppExtension
             },
