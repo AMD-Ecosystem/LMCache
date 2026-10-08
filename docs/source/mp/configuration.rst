@@ -326,6 +326,12 @@ single-L1 interface.
    * - ``--l1-init-size-gb``
      - ``20``
      - Initial allocation size (GB) when using lazy allocation.
+   * - ``--l1-mlock`` / ``--no-l1-mlock``
+     - ``True`` on ROCm, ``False`` elsewhere
+     - ``mlock()`` each L1 chunk before pinning it so that memory compaction
+       cannot migrate it. Only applies with ``--l1-use-lazy``; ignored
+       otherwise. ``--l1-manager`` JSON key: ``mlock``. See
+       *Pinned L1 memory on ROCm* below.
    * - ``--l1-align-bytes``
      - ``4096``
      - Alignment size in bytes (default 4 KB).
@@ -345,6 +351,49 @@ single-L1 interface.
        DAX L2 adapter with the same ``device_path`` is registered, that
        adapter's ``max_dax_size_gb`` is used as the L1 Device-DAX overflow
        size.
+
+Pinned L1 memory on ROCm
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+On ROCm, host memory registered with ``hipHostRegister`` is not page-locked:
+the kernel can still migrate its pages, for example during memory
+compaction. Each migration makes the GPU driver evict all GPU queues of the
+server process and revalidate the registration, so transfers stall and the
+server can freeze for tens of seconds
+(`#5361 <https://github.com/LMCache/LMCache/issues/5361>`_).
+``--l1-mlock`` (the default on ROCm) locks each lazy L1 chunk before it is
+registered and excludes L1 from transparent huge pages
+(``MADV_NOHUGEPAGE``): khugepaged migrates locked pages too when it collapses
+them into a huge page. For this to work:
+
+* The server needs an unlimited locked-memory limit, e.g.
+  ``docker run --ulimit memlock=-1`` (Kubernetes: a container runtime whose
+  default ``memlock`` limit is unlimited), or ``CAP_IPC_LOCK``. Otherwise
+  ``mlock`` fails: the server logs one warning and a summary, and runs with
+  the failed chunks unlocked.
+* The node must set ``vm.compact_unevictable_allowed=0``. With the default
+  ``1``, compaction still migrates mlocked pages; the server logs a warning at
+  startup in that case. ``vm.compaction_proactiveness=0`` is recommended as
+  well.
+* Transparent huge pages should be ``never``
+  (``/sys/kernel/mm/transparent_hugepage/enabled``). L1 itself is excluded,
+  but ROCm marks memory it allocates with ``hipHostMalloc`` as
+  ``MADV_HUGEPAGE``, so with ``always`` or ``madvise`` khugepaged still
+  collapses (migrates) such memory of the server. With L1 excluded and THP
+  ``always`` that cost about 1.6 s of queue eviction per GPU in a 5-minute
+  test, versus 30 s with L1 not excluded. With ``--no-l1-use-lazy`` (L1 from
+  ``hipHostMalloc``, which this option does not cover) and THP ``madvise``
+  it was 74 s.
+
+.. code-block:: bash
+
+   sysctl -w vm.compact_unevictable_allowed=0
+   sysctl -w vm.compaction_proactiveness=0
+
+Locking adds little to the startup time because registering the memory
+faults it in anyway. On MI355X, pinning a 200 GB ``--l1-init-size-gb`` took
+29 s instead of 26 s, and the background expansion of another 200 GB took
+26 s instead of 23 s.
 
 GDS L1 Tier
 -----------

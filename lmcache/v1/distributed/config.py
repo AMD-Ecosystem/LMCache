@@ -52,6 +52,11 @@ def _l1_bool(values: dict[str, object], name: str, default: bool) -> bool:
     return value
 
 
+def _default_l1_mlock() -> bool:
+    """Return the platform default for mlocking lazy L1 memory: on for ROCm."""
+    return current_device_spec.backend_name == "rocm"
+
+
 def _l1_path(values: dict[str, object]) -> str:
     """Read the non-empty backing path required by device-backed L1s."""
     path = values.get("path")
@@ -311,6 +316,16 @@ class L1MemoryManagerConfig:
     devdax_size_in_bytes: int = 0
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
 
+    mlock: bool = field(default_factory=_default_l1_mlock)
+    """ Whether to mlock() lazy L1 memory before pinning it, so that memory
+    compaction cannot migrate it when the node sets
+    ``vm.compact_unevictable_allowed=0``, and to exclude it from transparent
+    huge pages (``MADV_NOHUGEPAGE``) so that khugepaged does not migrate it
+    either. On ROCm, pinned (registered) host memory stays movable and every
+    migration evicts the process's GPU queues (LMCache #5361). Default is
+    True on ROCm and False elsewhere. Only the lazy allocator honors it; it
+    is ignored when ``use_lazy`` is False. """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
@@ -517,9 +532,10 @@ class DRAML1ManagerConfig(L1ManagerConfig):
             defaults,
             read_ttl,
             write_ttl,
-            {"use_lazy", "init_size_gb", "shm_name", "use_hugepages"},
+            {"use_lazy", "init_size_gb", "shm_name", "use_hugepages", "mlock"},
         )
         use_lazy = _l1_bool(values, "use_lazy", True)
+        mlock = _l1_bool(values, "mlock", _default_l1_mlock())
         hugepages = _l1_bool(values, "use_hugepages", False)
         shm_name = values.get("shm_name", "")
         if not isinstance(shm_name, str):
@@ -532,6 +548,7 @@ class DRAML1ManagerConfig(L1ManagerConfig):
             init_size_in_bytes=int(_l1_number(values, "init_size_gb", 20) * (1 << 30)),
             shm_name=shm_name,
             use_hugepages=hugepages,
+            mlock=mlock,
         )
         if hugepages:
             _check_hugepage_availability(config.memory_config.size_in_bytes)
@@ -820,6 +837,22 @@ def add_storage_manager_args(
         help="The initial size (GB) when using lazy allocation. Default is 20.",
     )
     memory_group.add_argument(
+        "--l1-mlock",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "mlock() lazy L1 memory before pinning it and exclude it from "
+            "transparent huge pages (MADV_NOHUGEPAGE), so that memory "
+            "compaction and khugepaged cannot migrate it. On ROCm every "
+            "migrated page of pinned L1 evicts the server's GPU queues and "
+            "stalls transfers. "
+            "Needs an unlimited memlock limit (or CAP_IPC_LOCK) and the node "
+            "sysctl vm.compact_unevictable_allowed=0. Only applies with "
+            "--l1-use-lazy; ignored otherwise. Default is on for ROCm and "
+            "off for other platforms."
+        ),
+    )
+    memory_group.add_argument(
         "--l1-align-bytes",
         type=int,
         default=4096,
@@ -1090,6 +1123,7 @@ def parse_args_to_config(
             logger.error("Hugepage availability check failed: %s", e)
             raise
 
+    mlock = _default_l1_mlock() if args.l1_mlock is None else args.l1_mlock
     if shm_name is None:
         memory_config = L1MemoryManagerConfig(
             size_in_bytes=int(args.l1_size_gb * (1 << 30)),
@@ -1098,6 +1132,7 @@ def parse_args_to_config(
             align_bytes=args.l1_align_bytes,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            mlock=mlock,
         )
     else:
         memory_config = L1MemoryManagerConfig(
@@ -1108,6 +1143,7 @@ def parse_args_to_config(
             shm_name=shm_name,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            mlock=mlock,
         )
 
     gds_l1_config: GdsL1Config | None = None

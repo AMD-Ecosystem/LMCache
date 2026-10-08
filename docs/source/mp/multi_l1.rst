@@ -64,8 +64,10 @@ TTLs must be positive integers. Unknown fields are rejected.
      - Backend fields
    * - ``DRAM``
      - ``use_lazy`` (true), ``init_size_gb`` (20, capped at capacity),
-       ``shm_name`` (empty), ``use_hugepages`` (false). Shared memory and
-       hugepages require eager allocation. Shared-memory names must be unique.
+       ``shm_name`` (empty), ``use_hugepages`` (false), ``mlock`` (true on
+       ROCm, false elsewhere; lazy allocation only, see ``--l1-mlock`` in
+       :doc:`configuration`). Shared memory and hugepages require eager
+       allocation. Shared-memory names must be unique.
    * - ``DEVDAX``
      - Required ``path``; the allocator checks mapping size and device alignment.
    * - ``GDS``

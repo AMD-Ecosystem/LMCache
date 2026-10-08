@@ -54,13 +54,17 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
-            "final size is %d bytes, align bytes is %d bytes",
+            "final size is %d bytes, align bytes is %d bytes, mlock is %s",
             config.init_size_in_bytes,
             config.size_in_bytes,
             config.align_bytes,
+            config.mlock,
         )
         return LazyMemoryAllocator(
-            config.init_size_in_bytes, config.size_in_bytes, config.align_bytes
+            config.init_size_in_bytes,
+            config.size_in_bytes,
+            config.align_bytes,
+            mlock=config.mlock,
         )
     else:
         logger.debug(
