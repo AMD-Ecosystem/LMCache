@@ -121,7 +121,7 @@ def cuMemGetAddressRange(ptr: int) -> tuple:
     return err, int(base), size
 
 
-def cuMemImportFromShareableHandle(os_handle: object, handle_type: object) -> tuple:
+def cuMemImportFromShareableHandle(os_handle: int, handle_type: object) -> tuple:
     """``hipMemImportFromShareableHandle``: ``(err, handle)``.
 
     HIP takes ``osHandle`` as a pointer to the POSIX fd storage.
