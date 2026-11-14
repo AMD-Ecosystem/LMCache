@@ -11,9 +11,13 @@ pair and a test-installed resolver; one goes through the real channel.
 # Standard
 from multiprocessing import get_context
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 import ctypes
+import faulthandler
 import os
 import socket
+import time
+import traceback
 
 # Third Party
 import pytest
@@ -375,38 +379,98 @@ def _vmm_consumer(conn: Connection, sock: socket.socket) -> None:
     """Child: receive the wrapper (pipe) and its fd (SCM_RIGHTS), import,
     verify the producer's pattern, write back, and hold until released.
     """
-    torch.cuda.init()
-    torch.cuda.set_device(0)
+    faulthandler.dump_traceback_later(90)
+    try:
+        conn.send(("stage", "process entry"))
+        # VmmRocmIPCWrapper.to_tensor() selects the device while importing.
+        # Avoid a redundant HIP runtime initialization before that operation.
+        if not IS_ROCM:
+            torch.cuda.init()
+            torch.cuda.set_device(0)
+        conn.send(("stage", "device setup complete"))
 
-    wrapper = DeviceIPCWrapper.Deserialize(conn.recv_bytes())
-    assert isinstance(wrapper, VMM_WRAPPER)
-    export_id, fds, _flags, _addr = socket.recv_fds(sock, 4096, 1)
-    assert export_id == wrapper._export_id  # noqa: SLF001
+        wrapper = DeviceIPCWrapper.Deserialize(conn.recv_bytes())
+        assert isinstance(wrapper, VMM_WRAPPER)
+        conn.send(("stage", "wrapper received"))
 
-    # Stand-in for the fd transport: each resolve hands out a dup so a
-    # re-import after close also works.
-    set_fd_resolver(lambda eid: os.dup(fds[0]))
+        export_id, fds, _flags, _addr = socket.recv_fds(sock, 4096, 1)
+        assert export_id == wrapper._export_id  # noqa: SLF001
+        conn.send(("stage", "fd received"))
 
-    tensor = wrapper.to_tensor()
-    again = wrapper.to_tensor()  # idempotent second import, same mapping
-    same_mapping = tensor.data_ptr() == again.data_ptr()
+        # Stand-in for the fd transport: each resolve hands out a dup so a
+        # re-import after close also works.
+        set_fd_resolver(lambda eid: os.dup(fds[0]))
 
-    expected = torch.arange(
-        tensor.numel(), device=tensor.device, dtype=tensor.dtype
-    ).reshape(tensor.shape)
-    matches = bool(torch.equal(tensor, expected)) and same_mapping
+        tensor = wrapper.to_tensor()
+        conn.send(("stage", "first mapping complete"))
+        again = wrapper.to_tensor()  # idempotent second import, same mapping
+        conn.send(("stage", "second mapping complete"))
+        same_mapping = tensor.data_ptr() == again.data_ptr()
 
-    tensor.fill_(-1.0)
-    torch.cuda.synchronize()
+        expected = torch.arange(
+            tensor.numel(), device=tensor.device, dtype=tensor.dtype
+        ).reshape(tensor.shape)
+        matches = bool(torch.equal(tensor, expected)) and same_mapping
 
-    wrapper.close()
-    reopened = wrapper.to_tensor()  # fresh import proves a clean unmap
-    matches = matches and bool((reopened == -1.0).all().item())
-    wrapper.close()
-    os.close(fds[0])
+        tensor.fill_(-1.0)
+        torch.cuda.synchronize()
 
-    conn.send(matches)
-    conn.recv()  # hold until the parent verified the write-back
+        wrapper.close()
+        conn.send(("stage", "first close complete"))
+        reopened = wrapper.to_tensor()  # fresh import proves a clean unmap
+        conn.send(("stage", "reopen complete"))
+        matches = matches and bool((reopened == -1.0).all().item())
+        wrapper.close()
+        os.close(fds[0])
+
+        conn.send(("result", matches))
+        conn.recv()  # hold until the parent verified the write-back
+    except BaseException:
+        try:
+            conn.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        raise
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _recv_vmm_consumer_result(
+    conn: Connection, child: BaseProcess, timeout: float = 120
+) -> bool:
+    """Receive progress until the VMM consumer reports its result."""
+    deadline = time.monotonic() + timeout
+    last_stage = "not started"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(
+                f"consumer timed out; last stage: {last_stage}; "
+                f"exit code: {child.exitcode}"
+            )
+        if not conn.poll(min(remaining, 1.0)):
+            if child.exitcode is not None:
+                pytest.fail(
+                    f"consumer exited before reporting; last stage: {last_stage}; "
+                    f"exit code: {child.exitcode}"
+                )
+            continue
+
+        try:
+            kind, payload = conn.recv()
+        except EOFError:
+            pytest.fail(
+                f"consumer pipe closed; last stage: {last_stage}; "
+                f"exit code: {child.exitcode}"
+            )
+        if kind == "stage":
+            last_stage = payload
+        elif kind == "error":
+            pytest.fail(f"consumer failed after {last_stage}:\n{payload}")
+        elif kind == "result":
+            return bool(payload)
+        else:
+            pytest.fail(f"unexpected consumer message: {(kind, payload)!r}")
 
 
 def test_cross_process_round_trip_of_interior_view(clear_fd_resolver) -> None:
@@ -440,10 +504,7 @@ def test_cross_process_round_trip_of_interior_view(clear_fd_resolver) -> None:
         try:
             parent_conn.send_bytes(payload)
             socket.send_fds(parent_sock, [export_id], [fd])
-            # poll() before recv(): a crashed consumer must fail the test,
-            # not block recv() forever.
-            assert parent_conn.poll(120), "consumer died before reporting"
-            assert parent_conn.recv() is True
+            assert _recv_vmm_consumer_result(parent_conn, child) is True
 
             torch.cuda.synchronize()
             assert bool((view == -1.0).all().item())  # consumer wrote back
@@ -497,8 +558,8 @@ def test_cross_process_round_trip_of_dim0_padded_view(clear_fd_resolver) -> None
         try:
             parent_conn.send_bytes(payload)
             socket.send_fds(parent_sock, [export_id], [fd])
-            assert parent_conn.poll(120), "consumer died before reporting"
-            assert parent_conn.recv() is True  # consumer saw the exact pattern
+            # Consumer saw the exact pattern.
+            assert _recv_vmm_consumer_result(parent_conn, child) is True
 
             torch.cuda.synchronize()
             assert bool((view == -1.0).all().item())  # consumer wrote back
