@@ -124,10 +124,11 @@ def cuMemGetAddressRange(ptr: int) -> tuple:
 def cuMemImportFromShareableHandle(os_handle: object, handle_type: object) -> tuple:
     """``hipMemImportFromShareableHandle``: ``(err, handle)``.
 
-    A POSIX fd travels in the pointer argument by value, as on CUDA.
+    HIP takes ``osHandle`` as a pointer to the POSIX fd storage.
     """
+    fd = ctypes.c_int(int(os_handle))
     return _clear_sticky_error(
-        hip.hipMemImportFromShareableHandle(os_handle, handle_type)
+        hip.hipMemImportFromShareableHandle(ctypes.addressof(fd), handle_type)
     )
 
 
